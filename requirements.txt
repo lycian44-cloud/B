@@ -1,0 +1,11 @@
+# Flask 대시보드 서버
+flask>=2.2.5
+
+# Binance API 클라이언트
+python-binance>=1.0.19
+
+# 환경변수 관리
+python-dotenv>=1.0.0
+
+# HTTP 요청 (텔레그램, 프록시)
+requests>=2.31.0
