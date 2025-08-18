@@ -1,1189 +1,912 @@
-# bot.py — v 1.0.1
-
-import os, math, time, json, threading, traceback
+import os
+import time
+import logging
+import json
 from datetime import datetime
-from flask import Flask, request, jsonify, Response, render_template_string, abort
 from dotenv import load_dotenv
-import requests
 from binance.client import Client
-from binance.enums import (
-    SIDE_BUY, SIDE_SELL,
-    ORDER_TYPE_MARKET, ORDER_TYPE_LIMIT, TIME_IN_FORCE_GTC,
-    FUTURE_ORDER_TYPE_MARKET, FUTURE_ORDER_TYPE_LIMIT
-)
-from binance.exceptions import BinanceAPIException, BinanceRequestException
-from websocket import WebSocketApp
+from binance.exceptions import BinanceAPIException
+from binance.enums import *
+from flask import Flask, jsonify, request, render_template
+from flask_cors import CORS
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
-# ========= ENV =========
-load_dotenv()
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-WEBHOOK_CHECK_ENABLED = os.getenv("WEBHOOK_CHECK_ENABLED", "false").lower() == "true"
-WEBHOOK_DEFAULT_VALID = int(os.getenv("WEBHOOK_DEFAULT_VALID", "60"))
+# .env 파일 로드 (일반 환경 변수)
+load_dotenv(dotenv_path='.env')
+# .env.secrets 파일 로드 (민감한 환경 변수)
+load_dotenv(dotenv_path='.env.secrets')
 
-USE_WEBSOCKET = os.getenv("USE_WEBSOCKET", "true").lower() == "true"
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "2"))
-TOP_N = int(os.getenv("TOP_N", "30"))
-VOLUME_REFRESH_SEC = int(os.getenv("VOLUME_REFRESH_SEC", "10"))
-MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "0"))
+# --- API 키 및 URL 설정 ---
+# 테스트넷 현물
+BINANCE_TESTNET_API_URL_SPOT = os.getenv('BINANCE_TESTNET_API_URL_SPOT') # https://testnet.binance.vision
+API_KEY_SPOT_TESTNET = os.getenv('BINANCE_TESTNET_API_KEY_SPOT')
+SECRET_KEY_SPOT_TESTNET = os.getenv('BINANCE_TESTNET_SECRET_KEY_SPOT')
 
-SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
-SYMBOL_BLACKLIST = [s.strip().upper() for s in os.getenv("SYMBOL_BLACKLIST", "").split(",") if s.strip()]
+# 테스트넷 선물
+BINANCE_TESTNET_API_URL_FUTURES = "https://testnet.binancefuture.com/fapi"
+API_KEY_FUTURES_TESTNET = os.getenv('BINANCE_TESTNET_API_KEY_FUTURES')
+SECRET_KEY_FUTURES_TESTNET = os.getenv('BINANCE_TESTNET_SECRET_KEY_FUTURES')
 
-# 임계값은 BPS(=만분율)로 받음. 예) 50 bps = 0.50%
-ENTRY_THRESHOLD_BPS = float(os.getenv("ENTRY_THRESHOLD_BPS", "50"))
-EXIT_THRESHOLD_BPS  = float(os.getenv("EXIT_THRESHOLD_BPS", "10"))
-STOP_LOSS_BPS       = float(os.getenv("STOP_LOSS_BPS", "30"))
-ALLOW_NEGATIVE_BASIS = os.getenv("ALLOW_NEGATIVE_BASIS", "true").lower() == "true"
+# 실제 현물
+BINANCE_REAL_API_URL_SPOT = "https://api.binance.com/api"
+API_KEY_SPOT_REAL = os.getenv('BINANCE_REAL_API_KEY_SPOT')
+SECRET_KEY_SPOT_REAL = os.getenv('BINANCE_REAL_SECRET_KEY_SPOT')
 
-# 새로 추가된 자동 청산 관련 설정
-AUTO_CLOSE_PNL_PCT = float(os.getenv("AUTO_CLOSE_PNL_PCT", "0.3")) # PNL % 기반 청산
-MAX_HOLDING_MIN = int(os.getenv("MAX_HOLDING_MIN", "120")) # 포지션 최대 유지 시간(분)
+# 실제 선물
+BINANCE_REAL_API_URL_FUTURES = "https://fapi.binance.com/fapi"
+API_KEY_FUTURES_REAL = os.getenv('BINANCE_REAL_API_KEY_FUTURES')
+SECRET_KEY_FUTURES_REAL = os.getenv('BINANCE_REAL_SECRET_KEY_FUTURES')
 
-LEVERAGE = int(os.getenv("LEVERAGE", "3"))
-MAX_SPOT_USDT = float(os.getenv("MAX_SPOT_USDT", "10"))
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+# 대시보드 인증 토큰 (백엔드에서만 사용)
+DASHBOARD_AUTH_TOKEN = os.getenv('DASHBOARD_AUTH_TOKEN')
 
-# 수수료/슬리피지 (상대값, 예: 0.001 = 10bps)
-TAKER_FEE_BPS_SPOT = float(os.getenv("TAKER_FEE_BPS_SPOT", "10")) / 10000.0
-TAKER_FEE_BPS_FUT  = float(os.getenv("TAKER_FEE_BPS_FUT", "2")) / 10000.0
-SLIPPAGE_BPS       = float(os.getenv("SLIPPAGE_BPS", "1")) / 10000.0
 
-REBALANCE_ENABLED = os.getenv("REBALANCE_ENABLED", "false").lower() == "true"
-REBALANCE_TARGET_SPOT_RATIO = float(os.getenv("REBALANCE_TARGET_SPOT_RATIO", "0.5"))
-REBALANCE_BAND = float(os.getenv("REBALANCE_BAND", "0.1"))
-REBALANCE_INTERVAL_SEC = int(os.getenv("REBALANCE_INTERVAL_SEC", "120"))
+# --- 필수 환경 변수 확인 (모든 API 키가 존재하는지) ---
+if not all([API_KEY_SPOT_TESTNET, SECRET_KEY_SPOT_TESTNET,
+            API_KEY_FUTURES_TESTNET, SECRET_KEY_FUTURES_TESTNET,
+            API_KEY_SPOT_REAL, SECRET_KEY_SPOT_REAL,
+            API_KEY_FUTURES_REAL, SECRET_KEY_FUTURES_REAL,
+            DASHBOARD_AUTH_TOKEN]): # DASHBOARD_AUTH_TOKEN도 확인
+    logging.error("오류: 모든 현물/선물 테스트넷 및 실제 거래용 API 키와 시크릿 키, 대시보드 인증 토큰이 설정되지 않았습니다.")
+    logging.error("`.env.secrets` 파일을 확인하고 모든 변수를 채워주세요.")
+    exit(1)
 
-USE_NATIVE_OCO_SPOT = os.getenv("USE_NATIVE_OCO_SPOT", "false").lower() == "true"
-NATIVE_OCO_TP_PCT = float(os.getenv("NATIVE_OCO_TP_PCT", "0.003"))
-NATIVE_OCO_SL_PCT = float(os.getenv("NATIVE_OCO_SL_PCT", "0.003"))
+# --- 바이낸스 클라이언트 초기화 ---
+# 테스트넷 클라이언트
+client_spot_testnet = Client(API_KEY_SPOT_TESTNET, SECRET_KEY_SPOT_TESTNET, tld='com')
+client_spot_testnet.API_URL = BINANCE_TESTNET_API_URL_SPOT # '/api' 제거
 
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "5000"))
-DASHBOARD_REFRESH_MS = int(os.getenv("DASHBOARD_REFRESH_MS", "5000"))
+client_futures_testnet = Client(API_KEY_FUTURES_TESTNET, SECRET_KEY_FUTURES_TESTNET, tld='com')
+client_futures_testnet.FUTURES_URL = BINANCE_TESTNET_API_URL_FUTURES
 
-# 선택적 보호들
-API_TOKEN = os.getenv("API_TOKEN", "").strip()  # 프로그램성 API 보호
-DASHBOARD_AUTH_TOKEN = os.getenv("DASHBOARD_AUTH_TOKEN", "").strip()  # 대시보드/관련 API 보호
+# 실제 거래용 클라이언트
+client_spot_real = Client(API_KEY_SPOT_REAL, SECRET_KEY_SPOT_REAL, tld='com')
+client_spot_real.API_URL = BINANCE_REAL_API_URL_SPOT
 
-# 텔레그램
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-THREAD_ID_DEFAULT = os.getenv("TELEGRAM_THREAD_ID_DEFAULT", "").strip()
-THREAD_MAP_JSON = os.getenv("TELEGRAM_THREAD_MAP_JSON", "").strip()
-try:
-    THREAD_MAP = json.loads(THREAD_MAP_JSON) if THREAD_MAP_JSON else {}
-except Exception:
-    THREAD_MAP = {}
+client_futures_real = Client(API_KEY_FUTURES_REAL, SECRET_KEY_FUTURES_REAL, tld='com')
+client_futures_real.FUTURES_URL = BINANCE_REAL_API_URL_FUTURES
 
-# 표시 포맷
-DEC_QTY  = int(os.getenv("DEC_QTY", "6"))
-DEC_PCT  = int(os.getenv("DEC_PCT", "3"))
-DEC_USDT = int(os.getenv("DEC_USDT", "4"))
-DEC_VOL  = int(os.getenv("DEC_VOL", "0"))
 
-EMOJI_LIVE, EMOJI_TESTNET, EMOJI_DRY = "🟢", "🧪", "📝"
-EMOJI_OPEN, EMOJI_CLOSE, EMOJI_EXEC, EMOJI_ERROR = "🚀","🧹","⚙️","❗"
-LABEL_LIVE, LABEL_TEST, LABEL_DRY = "LIVE","TESTNET","DRY"
-LABEL_OPEN, LABEL_CLOSE, LABEL_EXEC, LABEL_FAIL = "OPEN","CLOSE","EXEC","FAIL"
+# 클라이언트 매핑 (환경 및 유형별 접근)
+clients = {
+    'testnet': {
+        'spot': client_spot_testnet,
+        'margin': client_spot_testnet, # 마진은 현물 클라이언트 사용
+        'futures': client_futures_testnet
+    },
+    'real': {
+        'spot': client_spot_real,
+        'margin': client_spot_real, # 마진은 현물 클라이언트 사용
+        'futures': client_futures_real
+    }
+}
 
-# ========= Binance Client =========
-client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
 
-# ========= App / State =========
 app = Flask(__name__)
 
-state_lock = threading.Lock()
-ws_lock = threading.Lock()
+# --- CORS 설정 ---
+CORS(app)
 
-# 필터 캐시
-symbol_filters_cache = {}    # spot symbol -> filters
-filters_cache_ts = {}
-fut_symbol_filters_cache = {}  # futures filters map
-fut_filters_cache_ts = {}
-FILTERS_TTL = 300  # 5m
+# --- 전역 변수 및 캐시 ---
+exchange_info_cache_spot_testnet = {}
+exchange_info_cache_futures_testnet = {}
+exchange_info_cache_spot_real = {}
+exchange_info_cache_futures_real = {}
 
-# 포지션/시세/Tx
-positions = {}       # {symbol: {...}}
-transactions = []    # list of closes
-spot_last, fut_last = {}, {}
-top_universe = []    # [{symbol, volume}]
-last_top_symbols = [] # 대시보드 top5
-logs_ring, MAX_LOGS = [], 400
-RUNTIME_BLACKLIST = set()
+# API 연결 상태를 각 클라이언트별로 추적
+api_status = {
+    "testnet_spot": {"status": "미확인", "message": "초기화 중..."},
+    "testnet_futures": {"status": "미확인", "message": "초기화 중..."},
+    "real_spot": {"status": "미확인", "message": "초기화 중..."},
+    "real_futures": {"status": "미확인", "message": "초기화 중..."}
+}
+trade_history_file = 'trades.json'
+trade_history = [] # 봇 가동 기간 동안의 거래 내역 (초기 로드 후 업데이트)
 
-# 펀딩(목록 캐시)
-funding_list_cache, funding_list_ts = {}, {}
-FUNDING_TTL = 180  # 3m
-# 레버리지 캐시
-last_lev = {}
 
-# ========= 유틸 =========
-def now_ms(): return int(time.time()*1000)
+# --- 재시도 설정 ---
+binance_api_retry_decorator = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    retry=retry_if_exception_type(BinanceAPIException),
+    before_sleep=before_sleep_log(logging.root, logging.INFO),
+    reraise=True
+)
 
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    with state_lock:
-        logs_ring.append(line)
-        if len(logs_ring) > MAX_LOGS:
-            del logs_ring[:len(logs_ring)-MAX_LOGS]
+# --- 헬퍼 함수 ---
 
-def fmt_qty(x):  return f"{x:.{DEC_QTY}f}"
-def fmt_usdt(x): return f"{x:.{DEC_USDT}f}"
+def _round_step_size(value, step_size):
+    """지정된 step_size에 맞춰 값을 반올림합니다."""
+    return float(step_size) * round(float(value) / float(step_size))
 
-def run_tag():
-    if DRY_RUN: return f"{EMOJI_DRY} [{LABEL_DRY}]"
-    if USE_TESTNET: return f"{EMOJI_TESTNET} [{LABEL_TEST}]"
-    return f"{EMOJI_LIVE} [{LABEL_LIVE}]"
+@binance_api_retry_decorator
+def _get_exchange_info_from_api(client_obj, client_type_str):
+    """API에서 거래소 정보를 가져옵니다 (재시도 적용)."""
+    logging.info(f"{client_type_str} 거래소 정보 API 호출 시도...")
+    if client_type_str.endswith('spot') or client_type_str.endswith('margin'): # 현물/마진 클라이언트
+        return client_obj.get_exchange_info()
+    elif client_type_str.endswith('futures'): # 선물 클라이언트
+        return client_obj.get_exchange_info()
+    else:
+        raise ValueError("잘못된 클라이언트 타입 문자열입니다.")
 
-def tg_thread_id(symbol=None):
-    try:
-        if symbol and symbol in THREAD_MAP: return int(THREAD_MAP[symbol])
-        if THREAD_ID_DEFAULT: return int(THREAD_ID_DEFAULT)
-    except Exception:
-        pass
-    return None
-
-def _telegram_post(text, thread_id=None, max_retry=5):
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID): return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    if thread_id: data["message_thread_id"] = thread_id
-    delay = 1
-    for _ in range(max_retry):
-        try:
-            r = requests.post(url, data=data, timeout=8)
-            if r.status_code == 200: return
-            log(f"[TG ERR] {r.status_code} {r.text[:200]}")
-        except Exception as e:
-            log(f"[TG EXC] {e}")
-        time.sleep(delay); delay = min(delay*2, 16)
-
-def telegram_send(text, symbol=None):
-    _telegram_post(text, thread_id=tg_thread_id(symbol))
-
-def backoff_call(fn, *args, max_wait=60, **kwargs):
-    delay = 1
-    while True:
-        try:
-            return fn(*args, **kwargs)
-        except (BinanceAPIException, BinanceRequestException, requests.exceptions.RequestException) as e:
-            log(f"[REST BACKOFF] {fn.__name__}: {e}")
-            time.sleep(delay)
-            delay = min(delay*2, max_wait)
-
-# ========= 심볼 필터 =========
-def apply_symbol_filters(rows, debug=False):
-    merged_bl = set(SYMBOL_BLACKLIST) | set(RUNTIME_BLACKLIST)
-    out = []
-    for r in rows:
-        sym = r.get("symbol","")
-        if not sym.endswith("USDT"):
-            if debug: log(f"[FILTER] drop {sym}: not USDT")
-            continue
-        qv = float(r.get("quoteVolume", 0.0))
-        if MIN_QUOTE_VOLUME_USDT and qv < MIN_QUOTE_VOLUME_USDT:
-            if debug: log(f"[FILTER] drop {sym}: qv {qv} < MIN_QV {MIN_QUOTE_VOLUME_USDT}")
-            continue
-        if SYMBOL_WHITELIST and sym not in SYMBOL_WHITELIST:
-            if debug: log(f"[FILTER] drop {sym}: not in WL")
-            continue
-        if sym in merged_bl:
-            if debug: log(f"[FILTER] drop {sym}: in BL/runtimeBL")
-            continue
-        out.append((sym, qv))
-    out.sort(key=lambda x: x[1], reverse=True)
-    return [{"symbol": s, "volume": v} for s, v in out]
-
-def get_top_symbols_rest(limit=TOP_N):
-    fut_rows = backoff_call(client.futures_ticker)
-    fut_rows.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-    top_fut = fut_rows[:limit]
-    spot_list = backoff_call(client.get_all_tickers)
-    spot_syms = {t["symbol"] for t in spot_list}
-    combined = [r for r in top_fut if r.get("symbol","") in spot_syms]
-    syms = apply_symbol_filters(combined, debug=False)
-    if not syms:
-        log(f"[ENTRY] no symbols after filters (MIN_QV={MIN_QUOTE_VOLUME_USDT}, WL/BL/runtimeBL)")
-    return syms
-
-# ========= 가격/베이시스 =========
-def futures_price(symbol):
-    try: return float(backoff_call(client.futures_symbol_ticker, symbol=symbol)["price"])
-    except Exception: return None
-
-def spot_price(symbol):
-    try: return float(backoff_call(client.get_symbol_ticker, symbol=symbol)["price"])
-    except Exception: return None
-
-def calc_basis_pct_live(symbol):
-    with ws_lock:
-        s, f = spot_last.get(symbol), fut_last.get(symbol)
-    if s is None: s = spot_price(symbol)
-    if f is None: f = futures_price(symbol)
-    if s is None or f is None or s <= 0: return None
-    return (f - s) / s
-
-# ========= LOT SIZE (현물/선물) =========
-def round_step(qty, step):
-    if step <= 0: return qty
-    prec = max(0, int(round(-math.log(step, 10), 0)))
-    return float(f"{math.floor(qty/step)*step:.{prec}f}")
-
-def lot_adjust(symbol, qty):
-    ts_now = time.time()
-    with state_lock:
-        filters = symbol_filters_cache.get(symbol)
-        if filters and ts_now - filters_cache_ts.get(symbol, 0) < FILTERS_TTL:
-            pass
-        else:
-            info = backoff_call(client.get_symbol_info, symbol=symbol)
-            filters = {f["filterType"]: f for f in info["filters"]}
-            symbol_filters_cache[symbol] = filters
-            filters_cache_ts[symbol] = ts_now
-    lot = filters.get("LOT_SIZE", {})
-    step = float(lot.get("stepSize","0.000001"))
-    minq = float(lot.get("minQty","0"))
-    maxq = float(lot.get("maxQty","1e12"))
-    q = round_step(qty, step)
-    return max(min(q, maxq), minq)
-
-def fut_lot_adjust(symbol, qty):
-    ts = time.time()
-    with state_lock:
-        filters = fut_symbol_filters_cache.get(symbol)
-        fresh = filters and ts - fut_filters_cache_ts.get(symbol, 0) < FILTERS_TTL
-    if not fresh:
-        info = backoff_call(client.futures_exchange_info)
-        fmap = {s["symbol"]: {f["filterType"]: f for f in s["filters"]} for s in info["symbols"]}
-        filters = fmap.get(symbol, {})
-        with state_lock:
-            fut_symbol_filters_cache[symbol] = filters
-            fut_filters_cache_ts[symbol] = ts
-    lot = filters.get("LOT_SIZE", {})
-    step = float(lot.get("stepSize","0.001"))
-    minq = float(lot.get("minQty","0"))
-    maxq = float(lot.get("maxQty","1e12"))
-    q = round_step(qty, step)
-    return max(min(q, maxq), minq)
-
-def change_leverage(symbol, lev):
-    try:
-        if last_lev.get(symbol) == lev: return
-        backoff_call(client.futures_change_leverage, symbol=symbol, leverage=lev)
-        last_lev[symbol] = lev
-    except Exception as e:
-        log(f"[WARN] leverage set fail {symbol}: {e}")
-
-# ========= 주문 =========
-def tg_order_message(market, symbol, side, qty, order_type, price=None, reduce_only=False, resp=None, action="EXEC"):
-    tag = run_tag()
-    em = {"OPEN": EMOJI_OPEN, "CLOSE": EMOJI_CLOSE, "EXEC": EMOJI_EXEC}.get(action, EMOJI_EXEC)
-    px = "" if (price is None or (isinstance(price,(int,float)) and price==0)) else f" @ {price}"
-    ro = " reduceOnly" if reduce_only else ""
-    rid = None
-    try: rid = resp.get("orderId") or resp.get("orderListId") or resp.get("clientOrderId")
-    except Exception: pass
-    rid_txt = f" id={rid}" if rid else ""
-    mock = " (mock)" if resp and resp.get("mock") else ""
-    return f"{tag} {em} [{action}] {market} {symbol} {side} qty={fmt_qty(qty)} {order_type}{px}{ro}{rid_txt}{mock}"
-
-def tg_error_message(symbol, when, exc):
-    tag = run_tag()
-    code = exc.code if isinstance(exc, BinanceAPIException) else None
-    msg = exc.message if isinstance(exc, BinanceAPIException) else str(exc)
-    body = f"{tag} {EMOJI_ERROR} [{LABEL_FAIL}] {symbol} at {when}"
-    if code is not None: body += f" | code={code}"
-    if msg: body += f" | {msg[:200]}"
-    return body
-
-def place_spot_order(symbol, side, qty, order_type=ORDER_TYPE_MARKET, price=None):
-    if DRY_RUN:
-        resp = {"mock": True}
-        log(f"[DRY][SPOT] {symbol} {side} qty={fmt_qty(qty)} {order_type} price={price}")
-        telegram_send(tg_order_message("SPOT", symbol, side, qty, order_type, price=price, resp=resp), symbol=symbol)
-        return resp
-    try:
-        if order_type == ORDER_TYPE_MARKET:
-            resp = backoff_call(client.create_order, symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty)
-        elif order_type == ORDER_TYPE_LIMIT:
-            if price is None: raise ValueError("limit price required")
-            resp = backoff_call(client.create_order, symbol=symbol, side=side, type=ORDER_TYPE_LIMIT,
-                                 timeInForce=TIME_IN_FORCE_GTC, quantity=qty, price=f"{price}")
-        else:
-            raise ValueError("unsupported spot order type")
-        telegram_send(tg_order_message("SPOT", symbol, side, qty, order_type, price=price, resp=resp), symbol=symbol)
-        return resp
-    except Exception as e:
-        telegram_send(tg_error_message(symbol, "place_spot_order", e), symbol=symbol)
-        raise
-
-def place_spot_oco_sell(symbol, qty, price, stop_price, stop_limit_price):
-    if DRY_RUN:
-        resp = {"mock": True}
-        log(f"[DRY][SPOT-OCO] SELL {symbol} qty={fmt_qty(qty)} price={price}, stop={stop_price}/{stop_limit_price}")
-        desc = f"tp:{price} sp:{stop_price}/{stop_limit_price}"
-        telegram_send(tg_order_message("SPOT-OCO", symbol, "SELL", qty, "OCO", price=desc, resp=resp), symbol=symbol)
-        return resp
-    try:
-        resp = backoff_call(
-            client.create_oco_order,
-            symbol=symbol, side=SIDE_SELL, quantity=qty,
-            price=f"{price}", stopPrice=f"{stop_price}",
-            stopLimitPrice=f"{stop_limit_price}", stopLimitTimeInForce=TIME_IN_FORCE_GTC
-        )
-        desc = f"tp:{price} sp:{stop_price}/{stop_limit_price}"
-        telegram_send(tg_order_message("SPOT-OCO", symbol, "SELL", qty, "OCO", price=desc, resp=resp), symbol=symbol)
-        return resp
-    except Exception as e:
-        telegram_send(tg_error_message(symbol, "spot_oco", e), symbol=symbol)
-        log(f"[WARN] spot OCO failed {symbol}: {e}")
+def get_symbol_filters(symbol, env_type, client_type):
+    """
+    특정 심볼의 거래 규칙 (minQty, stepSize, tickSize 등)을 가져오거나 캐시에서 반환합니다.
+    """
+    cache_map = {
+        ('testnet', 'spot'): exchange_info_cache_spot_testnet,
+        ('testnet', 'futures'): exchange_info_cache_futures_testnet,
+        ('real', 'spot'): exchange_info_cache_spot_real,
+        ('real', 'futures'): exchange_info_cache_futures_real,
+        ('testnet', 'margin'): exchange_info_cache_spot_testnet, # 마진은 현물 필터 공유
+        ('real', 'margin'): exchange_info_cache_spot_real # 마진은 현물 필터 공유
+    }
+    cache = cache_map.get((env_type, client_type))
+    if not cache:
+        logging.error(f"잘못된 환경/클라이언트 타입 조합: ({env_type}, {client_type})")
         return None
 
-def place_fut_order(symbol, side, qty, order_type=FUTURE_ORDER_TYPE_MARKET, price=None, reduce_only=False):
-    if DRY_RUN:
-        resp = {"mock": True}
-        log(f"[DRY][FUT] {symbol} {side} qty={fmt_qty(qty)} {order_type} reduce={reduce_only} price={price}")
-        telegram_send(tg_order_message("FUT", symbol, side, qty, order_type, price=price, reduce_only=reduce_only, resp=resp), symbol=symbol)
-        return resp
-    change_leverage(symbol, LEVERAGE)
+    if symbol in cache:
+        return cache[symbol]
+
     try:
-        params = dict(symbol=symbol, side=side, type=order_type, quantity=qty)
-        if reduce_only: params["reduceOnly"] = True
-        if order_type == FUTURE_ORDER_TYPE_LIMIT:
-            if price is None: raise ValueError("limit price required")
-            params["price"] = f"{price}"
-            params["timeInForce"] = TIME_IN_FORCE_GTC
-        resp = backoff_call(client.futures_create_order, **params)
-        telegram_send(tg_order_message("FUT", symbol, side, qty, order_type, price=price, reduce_only=reduce_only, resp=resp), symbol=symbol)
-        return resp
+        client_obj = clients[env_type][client_type]
+        info = _get_exchange_info_from_api(client_obj, f"{env_type}_{client_type}")
+        for s in info['symbols']:
+            if s['symbol'] == symbol:
+                filters = {f['filterType']: f for f in s['filters']}
+                cache[symbol] = filters
+                logging.info(f"{env_type.upper()} {client_type.upper()} {symbol}의 거래 규칙 캐시됨: {filters}")
+                return filters
+        logging.warning(f"{env_type.upper()} {client_type.upper()} 심볼 {symbol}의 거래 규칙을 찾을 수 없습니다.")
+        return None
+    except BinanceAPIException as e:
+        logging.error(f"{env_type.upper()} {client_type.upper()} 거래 규칙을 가져오는 데 실패했습니다 (API 오류): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+        if e.code in [None, -1022]: # -1022는 SIGNATURE_INVALID 등 시간 동기화 문제일 수 있음
+            logging.error("API 키/시크릿, IP 화이트리스트, 시스템 시간 동기화를 확인하세요.")
+        return None
     except Exception as e:
-        telegram_send(tg_error_message(symbol, "place_fut_order", e), symbol=symbol)
+        logging.error(f"{env_type.upper()} {client_type.upper()} 거래 규칙을 가져오는 데 알 수 없는 오류 발생: {e}")
+        return None
+
+def get_tick_size(symbol, env_type, client_type):
+    """특정 심볼의 tickSize를 반환합니다."""
+    filters = get_symbol_filters(symbol, env_type, client_type)
+    if filters and 'PRICE_FILTER' in filters:
+        return float(filters['PRICE_FILTER']['tickSize'])
+    return None
+
+def get_lot_size_filters(symbol, env_type, client_type):
+    """특정 심볼의 LOT_SIZE 필터를 반환합니다."""
+    filters = get_symbol_filters(symbol, env_type, client_type)
+    if filters and 'LOT_SIZE' in filters:
+        return {
+            'minQty': float(filters['LOT_SIZE']['minQty']),
+            'maxQty': float(filters['LOT_SIZE']['maxQty']),
+            'stepSize': float(filters['LOT_SIZE']['stepSize'])
+        }
+    return None
+
+def get_min_notional(symbol, env_type, client_type):
+    """특정 심볼의 MIN_NOTIONAL 값을 반환합니다."""
+    filters = get_symbol_filters(symbol, env_type, client_type)
+    if filters and 'MIN_NOTIONAL' in filters:
+        return float(filters['MIN_NOTIONAL']['minNotional'])
+    return None
+
+def validate_quantity(symbol, quantity, env_type, client_type):
+    """
+    주문 수량이 심볼의 거래 규칙에 맞는지 검증합니다.
+    """
+    filters = get_symbol_filters(symbol, env_type, client_type)
+    if not filters:
+        return False, "심볼의 거래 규칙을 가져올 수 없습니다. API 키/IP 화이트리스트/시간 동기화 확인."
+
+    lot_size_filter = filters.get('LOT_SIZE')
+    if lot_size_filter:
+        min_qty = float(lot_size_filter.get('minQty'))
+        max_qty = float(lot_size_filter.get('maxQty'))
+        step_size = float(lot_size_filter.get('stepSize'))
+
+        if quantity < min_qty:
+            return False, f"최소 주문 수량 {min_qty}보다 작습니다."
+        if quantity > max_qty:
+            return False, f"최대 주문 수량 {max_qty}보다 큽니다."
+
+        remainder = (quantity - min_qty) % step_size
+        if abs(remainder) > 1e-8 and abs(remainder - step_size) > 1e-8:
+            return False, f"주문 수량({quantity})이 스텝 사이즈({step_size})에 맞지 않습니다. (최소 수량 {min_qty} 고려)"
+    else:
+        logging.warning(f"{env_type.upper()} {client_type.upper()} {symbol}에 대한 LOT_SIZE 필터를 찾을 수 없습니다. 수량 검증을 건너뜕니다.")
+
+    return True, "유효한 수량입니다."
+
+
+def load_trade_history():
+    """trades.json 파일에서 거래 내역을 로드합니다."""
+    global trade_history
+    if os.path.exists(trade_history_file):
+        try:
+            with open(trade_history_file, 'r') as f:
+                trade_history = json.load(f)
+            logging.info(f"{len(trade_history)}개의 거래 내역을 {trade_history_file}에서 로드했습니다.")
+        except json.JSONDecodeError as e:
+            logging.error(f"거래 내역 파일 로드 실패 (JSON 형식 오류): {e}")
+            trade_history = []
+        except Exception as e:
+            logging.error(f"거래 내역 파일 로드 중 알 수 없는 오류 발생: {e}")
+            trade_history = []
+    else:
+        logging.info("거래 내역 파일이 없습니다. 새롭게 생성합니다.")
+        trade_history = []
+
+def save_trade_history():
+    """거래 내역을 trades.json 파일에 저장합니다."""
+    try:
+        with open(trade_history_file, 'w') as f:
+            json.dump(trade_history, f, indent=4)
+        logging.info("거래 내역을 파일에 저장했습니다.")
+    except Exception as e:
+        logging.error(f"거래 내역 파일 저장 실패: {e}")
+
+# 시작 시 거래 내역 로드
+load_trade_history()
+
+# --- Flask 라우트 정의 ---
+
+@app.route('/')
+def redirect_to_dashboard():
+    return render_template('dashboard.html')
+
+@app.route('/dashboard.html')
+def serve_dashboard():
+    return render_template('dashboard.html')
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    """대시보드 인증 토큰을 검증합니다."""
+    data = request.get_json()
+    token = data.get('token')
+    if token == DASHBOARD_AUTH_TOKEN:
+        return jsonify({"success": True, "message": "로그인 성공!"})
+    else:
+        return jsonify({"success": False, "message": "잘못된 토큰입니다."}), 401 # Unauthorized
+
+@app.route('/api/api_status', methods=['GET'])
+def get_api_status():
+    """API 연결 상태를 반환합니다."""
+    return jsonify(api_status)
+
+@app.route('/api/top_market_data', methods=['GET'])
+@binance_api_retry_decorator
+def get_top_market_data():
+    """
+    선택된 환경(trade_env)의 현물 거래소 거래량 상위 50개와 선물 거래소 거래량 상위 50개 중
+    서로 겹치는 거래쌍을 선물 거래량 순으로 최대 10개 반환합니다.
+    """
+    trade_env = request.args.get('trade_env', 'real').strip() # 기본값 실제 거래, 공백 제거
+    
+    # 선택된 환경의 클라이언트 사용
+    spot_client = clients[trade_env]['spot']
+    futures_client = clients[trade_env]['futures']
+
+    try:
+        # 현물 거래소 상위 50개 심볼 가져오기
+        spot_tickers = spot_client.get_ticker()
+        spot_top_50 = sorted(spot_tickers, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)[:50]
+        spot_symbols_map = {t['symbol']: t for t in spot_top_50}
+        logging.info(f"{trade_env.upper()} 현물 상위 50개 심볼 조회 완료: {len(spot_symbols_map)}개.")
+
+        # 선물 거래소 상위 50개 심볼 가져오기
+        futures_tickers = futures_client.get_ticker()
+        futures_top_50 = sorted(futures_tickers, key=lambda x: float(x.get('volume', 0)), reverse=True)[:50]
+        futures_symbols_map = {t['symbol']: t for t in futures_top_50}
+        logging.info(f"{trade_env.upper()} 선물 상위 50개 심볼 조회 완료: {len(futures_symbols_map)}개.")
+
+        # 겹치는 심볼 찾기 및 선물 거래량 기준으로 정렬 후 상위 10개만 선택
+        common_symbols_sorted = sorted([
+            (s, float(futures_symbols_map[s].get('volume', 0)))
+            for s in spot_symbols_map.keys() if s in futures_symbols_map
+        ], key=lambda x: x[1], reverse=True)[:10] # 상위 10개만 선택
+        
+        logging.info(f"겹치는 심볼 및 선물 거래량 순 정렬 완료: {len(common_symbols_sorted)}개.")
+
+        result_data = []
+        for symbol, _ in common_symbols_sorted:
+            spot_price = None
+            futures_price = None
+            spot_volume = None
+            futures_volume = None
+
+            try:
+                spot_price = float(spot_symbols_map[symbol]['lastPrice'])
+                spot_volume = float(spot_symbols_map[symbol]['quoteVolume'])
+            except KeyError:
+                logging.warning(f"현물 심볼 {symbol}의 캐시된 시세 정보 부족.")
+            except Exception as e:
+                logging.warning(f"현물 심볼 {symbol}의 시세 정보 파싱 실패: {e}")
+
+            try:
+                futures_price = float(futures_symbols_map[symbol]['lastPrice'])
+                futures_volume = float(futures_symbols_map[symbol]['volume'])
+            except KeyError:
+                logging.warning(f"선물 심볼 {symbol}의 캐시된 시세 정보 부족.")
+            except Exception as e:
+                logging.warning(f"선물 심볼 {symbol}의 시세 정보 파싱 실패: {e}")
+
+            result_data.append({
+                'symbol': symbol,
+                'spot_price': spot_price,
+                'futures_price': futures_price,
+                'spot_volume': spot_volume, 
+                'futures_volume': futures_volume
+            })
+        
+        # 시장 데이터 조회 성공 시 해당 환경의 API 상태 업데이트
+        api_status[f"{trade_env}_spot"]["status"] = "연결됨"
+        api_status[f"{trade_env}_spot"]["message"] = f"{trade_env.upper()} 현물 API 연결 정상."
+        api_status[f"{trade_env}_futures"]["status"] = "연결됨"
+        api_status[f"{trade_env}_futures"]["message"] = f"{trade_env.upper()} 선물 API 연결 정상."
+
+        return jsonify(result_data)
+
+    except BinanceAPIException as e:
+        logging.error(f"{trade_env.upper()} 시장 데이터 조회 실패 (API 오류): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+        # 해당 환경의 API 연결 오류로 간주
+        api_status[f"{trade_env}_spot"]["status"] = "오류"
+        api_status[f"{trade_env}_spot"]["message"] = f"{trade_env.upper()} 현물 API 오류: {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}"
+        api_status[f"{trade_env}_futures"]["status"] = "오류"
+        api_status[f"{trade_env}_futures"]["message"] = f"{trade_env.upper()} 선물 API 오류: {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}"
+        if e.code in [None, -1022]:
+            logging.error("API 키/시크릿, IP 화이트리스트, 시스템 시간 동기화를 확인하세요.")
+        raise
+    except Exception as e:
+        logging.error(f"{trade_env.upper()} 시장 데이터 조회 중 알 수 없는 오류 발생: {e}")
+        api_status[f"{trade_env}_spot"]["status"] = "오류"
+        api_status[f"{trade_env}_spot"]["message"] = f"{trade_env.upper()} 현물 서버 오류: {str(e)}"
+        api_status[f"{trade_env}_futures"]["status"] = "오류"
+        api_status[f"{trade_env}_futures"]["message"] = f"{trade_env.upper()} 선물 서버 오류: {str(e)}"
         raise
 
-def fut_close_market(symbol, qty, side):
-    return place_fut_order(symbol, side, qty, FUTURE_ORDER_TYPE_MARKET, reduce_only=True)
 
-# ========= 펀딩(목록 캐시) =========
-def funding_sum_since(symbol, t_open_ms):
-    try:
-        nowt = time.time()
-        need_refresh = (symbol not in funding_list_cache) or (nowt - funding_list_ts.get(symbol, 0) > FUNDING_TTL)
-        if need_refresh:
-            end = now_ms()
-            start = end - 48*3600*1000
-            rates = backoff_call(client.futures_funding_rate, symbol=symbol, startTime=start, endTime=end)
-            funding_list_cache[symbol] = [(int(r["fundingTime"]), float(r["fundingRate"])) for r in rates]
-            funding_list_ts[symbol] = nowt
-        return sum(rate for ts, rate in funding_list_cache[symbol] if ts >= t_open_ms)
-    except Exception as e:
-        log(f"[FUNDING WARN] {symbol}: {e}")
-        return 0.0
+@app.route('/api/trade', methods=['POST'])
+@binance_api_retry_decorator
+def trade():
+    """
+    거래 유형(현물/마진/선물) 및 환경(테스트넷/실제)에 따라 매수 또는 매도 주문을 실행합니다.
+    - 매수 시: 거래소 최소 주문 수량 또는 11 USDT 상당 수량 중 더 작은 값, 현재가보다 1 틱 낮은 지정가
+    - 매도 시: 현재 보유 코인 잔액 전부, 현재가보다 1 틱 높은 지정가
+    - is_close_position: True일 경우, 현재 포지션을 전량 청산
+    """
+    data = request.get_json()
+    symbol = data.get('symbol')
+    side = data.get('side') # 'BUY' or 'SELL'
+    trade_type = data.get('trade_type', '').strip() # 공백 제거
+    trade_env = data.get('trade_env', '').strip()   # 공백 제거
+    is_close_position = data.get('is_close_position', False) # 새로운 파라미터
+    order_execution_type = data.get('order_execution_type', ORDER_TYPE_LIMIT) # 'LIMIT' or 'MARKET'
+    
+    if not all([symbol, side, trade_type, trade_env]):
+        logging.warning(f"필수 파라미터 누락: symbol={symbol}, side={side}, trade_type={trade_type}, trade_env={trade_env}")
+        return jsonify({"error": "심볼, 사이드, 거래 유형, 거래 환경이 필요합니다."}), 400
 
-# ========= 포지션 =========
-def enter_position(symbol, mode):
-    with ws_lock:
-        s_cached = spot_last.get(symbol)
-        f_cached = fut_last.get(symbol)
-    s = s_cached if s_cached else spot_price(symbol)
-    if not s or s <= 0:
-        log(f"[OPEN SKIP] {symbol}: invalid spot price")
-        return False
-
-    # 수량: 현물 목표수량 → 각 시장 LOT 규칙에 맞춤 → 최소값으로 완전헤지
-    spot_qty_target = MAX_SPOT_USDT / s
-    spot_qty = lot_adjust(symbol, spot_qty_target)
-    fpx = f_cached if f_cached else futures_price(symbol)
-    if fpx is None: fpx = s  # 보수적 fallback
-    fut_qty = fut_lot_adjust(symbol, spot_qty)
-    qty = min(spot_qty, fut_qty)
-    if qty <= 0:
-        log(f"[OPEN SKIP] {symbol}: qty<=0 after lot adjust (spot={spot_qty}, fut={fut_qty})")
-        return False
-
-    # === 새로 추가: 베이시스 기반 청산 목표치 계산 ===
-    b_in = calc_basis_pct_live(symbol) or 0.0
-    tp_basis_pct = EXIT_THRESHOLD_BPS / 10000.0
-    sl_basis_pct = STOP_LOSS_BPS / 10000.0
-
-    if mode == "carry":
-        tp_basis = b_in - tp_basis_pct
-        sl_basis = b_in + sl_basis_pct
-    else: # reverse
-        tp_basis = b_in + tp_basis_pct
-        sl_basis = b_in - sl_basis_pct
-    # =================================================
-
-    try:
-        if mode == "carry":
-            place_spot_order(symbol, SIDE_BUY, qty, ORDER_TYPE_MARKET)
-            place_fut_order(symbol, SIDE_SELL, qty, FUTURE_ORDER_TYPE_MARKET)
-        else:
-            place_spot_order(symbol, SIDE_SELL, qty, ORDER_TYPE_MARKET)
-            place_fut_order(symbol, SIDE_BUY,  qty, FUTURE_ORDER_TYPE_MARKET)
-
-        f_now = f_cached if f_cached else futures_price(symbol)
-
-        with state_lock:
-            positions[symbol] = {
-                "dir": "carry_pos" if mode=="carry" else "reverse_pos",
-                "qty": qty,
-                "s_in": s,
-                "f_in": f_now,
-                "basis_in": b_in,
-                "tp_basis": tp_basis, # 추가
-                "sl_basis": sl_basis, # 추가
-                "t_open": now_ms()
-            }
-        telegram_send(f"{run_tag()} {EMOJI_OPEN} [{LABEL_OPEN}] {symbol} {mode} qty={fmt_qty(qty)} basis_in={(b_in*100):.{DEC_PCT}f}%", symbol=symbol)
-        if USE_NATIVE_OCO_SPOT and mode=="carry":
-            tp_price = s * (1 + NATIVE_OCO_TP_PCT)
-            sl_price = s * (1 - NATIVE_OCO_SL_PCT)
-            sl_limit = sl_price * 0.999
-            place_spot_oco_sell(symbol, qty, tp_price, sl_price, sl_limit)
-        return True
-    except Exception as e:
-        telegram_send(tg_error_message(symbol, "enter_position", e), symbol=symbol)
-        log(f"[OPEN FAIL] {symbol}: {e}")
-        return False
-
-def pos_symbol(pos):
-    for k,v in positions.items():
-        if v is pos: return k
-    return "UNKNOWN"
-
-def estimate_unrealized_pnl(pos, s_now, f_now):
-    s_in = pos["s_in"]
-    f_in = pos.get("f_in") or s_in
-    qty  = pos["qty"]
-    t_open = pos.get("t_open", now_ms())
-
-    if pos["dir"] == "carry_pos":
-        pnl_price = ((f_in - f_now) - (s_now - s_in)) / s_in
+    client_to_use = None
+    if trade_env in clients and trade_type in clients[trade_env]:
+        client_to_use = clients[trade_env][trade_type]
     else:
-        pnl_price = ((s_in - s_now) - (f_in - f_now)) / s_in
+        # 이 오류가 발생하면, 대시보드에서 잘못된 trade_env 또는 trade_type이 전송된 것임
+        logging.error(f"잘못된 환경/클라이언트 타입 조합: ({trade_env}, {trade_type})")
+        return jsonify({"error": "유효하지 않은 거래 환경 또는 유형입니다. (백엔드 검증)"}), 400
 
-    fees_total = (TAKER_FEE_BPS_SPOT + TAKER_FEE_BPS_FUT) * 2
-    slip_total = SLIPPAGE_BPS * 2
-    fund = funding_sum_since(pos_symbol(pos), t_open)
-    funding_adj = fund if pos["dir"] == "carry_pos" else -fund
-
-    pnl_total = pnl_price + funding_adj - fees_total - slip_total
-    notional = qty * s_in
-    return {
-        "pnl_price_rel": pnl_price,
-        "funding_rel": funding_adj,
-        "fees_rel": -fees_total,
-        "slip_rel": -slip_total,
-        "pnl_total_rel": pnl_total,
-        "pnl_total_usdt": pnl_total * notional,
-        "notional": notional
-    }
-
-def calc_realized_pnl(pos, s_now, f_now):
-    s_in = pos["s_in"]; f_in = pos.get("f_in") or s_in; qty = pos["qty"]
-    funding_rate_sum = funding_sum_since(pos_symbol(pos), pos["t_open"])
-    funding_usdt = funding_rate_sum * (qty * f_in)
-    if pos["dir"] == "reverse_pos": funding_usdt *= -1
-    fees_usdt_spot = (qty*s_in*TAKER_FEE_BPS_SPOT) + (qty*s_now*TAKER_FEE_BPS_SPOT)
-    fees_usdt_fut  = (qty*f_in*TAKER_FEE_BPS_FUT)  + (qty*f_now*TAKER_FEE_BPS_FUT)
-    fees_usdt = fees_usdt_spot + fees_usdt_fut
-    if pos["dir"] == "carry_pos":
-        pnl_price_usdt = (s_now - s_in)*qty + (f_in - f_now)*qty
-    else:
-        pnl_price_usdt = (s_in - s_now)*qty + (f_now - f_in)*qty
-    pnl_total_usdt = pnl_price_usdt + funding_usdt - fees_usdt
-    notional_usdt = qty * s_in
-    pnl_total_rel = (pnl_total_usdt / notional_usdt) if notional_usdt>0 else 0
-    return {"pnl_usdt": pnl_total_usdt, "pnl_pct": pnl_total_rel, "fees_usdt": fees_usdt,
-            "funding_usdt": funding_usdt, "pnl_price_usdt": pnl_price_usdt, "notional_usdt": notional_usdt}
-
-def close_position(symbol, reason="manual"):
-    with state_lock: pos = positions.get(symbol)
-    if not pos: return False
-    qty = pos["qty"]
     try:
-        if pos["dir"] == "carry_pos":
-            place_spot_order(symbol, SIDE_SELL, qty, ORDER_TYPE_MARKET)
-            fut_close_market(symbol, qty, SIDE_BUY)
-        else:
-            place_spot_order(symbol, SIDE_BUY, qty, ORDER_TYPE_MARKET)
-            fut_close_market(symbol, qty, SIDE_SELL)
-        t_close = now_ms()
-        s_now, f_now = spot_price(symbol), futures_price(symbol)
-        if s_now is not None and f_now is not None:
-            realized = calc_realized_pnl(pos, s_now, f_now)
-            tx = {"symbol": symbol, "t_open": pos["t_open"], "t_close": t_close,
-                  "holding_time_ms": t_close - pos["t_open"],
-                  "notional_usdt": realized["notional_usdt"],
-                  "pnl_usdt": realized["pnl_usdt"], "pnl_pct": realized["pnl_pct"],
-                  "fees_usdt": realized["fees_usdt"], "reason": reason}
-            with state_lock: transactions.append(tx)
-        with state_lock: positions.pop(symbol, None)
-        telegram_send(f"{run_tag()} {EMOJI_CLOSE} [{LABEL_CLOSE}] {symbol} reason={reason}", symbol=symbol)
-        return True
-    except Exception as e:
-        telegram_send(tg_error_message(symbol, "close_position", e), symbol=symbol)
-        log(f"[CLOSE FAIL] {symbol}: {e}")
-        return False
-
-# ========= 자동 청산 루프 (새로 추가된 기능) =========
-def check_positions_loop():
-    while True:
-        with state_lock:
-            active_positions = list(positions.items())
+        # 현재 시장가 및 틱 사이즈 가져오기
+        ticker_data = client_to_use.get_ticker(symbol=symbol)
+        current_price = float(ticker_data['lastPrice'])
         
-        for symbol, pos in active_positions:
-            try:
-                # 1. 가격 정보 업데이트
-                s_now = spot_last.get(symbol)
-                f_now = fut_last.get(symbol)
-                
-                # WS 가격 정보가 없으면 REST API로 가져오기 (폴백)
-                if s_now is None: s_now = spot_price(symbol)
-                if f_now is None: f_now = futures_price(symbol)
-                
-                if s_now is None or f_now is None:
-                    continue # 가격 정보가 없으면 다음 포지션으로 이동
+        # 호가창에서 best bid/ask 가져오기 (지정가 주문 시 체결 가능성 높은 가격 설정 위함)
+        order_book = client_to_use.get_order_book(symbol=symbol, limit=5) # 상위 5개 호가
+        best_bid = float(order_book['bids'][0][0]) if order_book['bids'] else current_price
+        best_ask = float(order_book['asks'][0][0]) if order_book['asks'] else current_price
 
-                # 2. PNL 및 시간 계산
-                pnl_data = estimate_unrealized_pnl(pos, s_now, f_now)
-                pnl_pct = pnl_data["pnl_total_rel"] * 100 # 백분율로 변환
-                holding_time_min = (now_ms() - pos["t_open"]) / 60000
+        tick_size = get_tick_size(symbol, trade_env, trade_type)
+        if not tick_size:
+            return jsonify({"error": f"심볼 {symbol}의 틱 사이즈를 가져올 수 없습니다. 거래 규칙 확인 필요."}), 500
 
-                # 3. 청산 조건 확인
-                reason = None
-                
-                # A. 베이시스 기반 청산 (이익 실현 및 손절매)
-                current_basis_pct = calc_basis_pct_live(symbol)
-                is_carry = (pos["dir"] == "carry_pos")
-                
-                # 이익 실현 (베이시스가 목표치에 도달하거나 초과)
-                if is_carry and current_basis_pct <= pos["tp_basis"]:
-                    reason = "take_profit_basis"
-                elif not is_carry and current_basis_pct >= pos["tp_basis"]:
-                    reason = "take_profit_basis"
-                
-                # 손절매 (베이시스가 목표치에 도달하거나 초과)
-                if not reason:
-                    if is_carry and current_basis_pct >= pos["sl_basis"]:
-                        reason = "stop_loss_basis"
-                    elif not is_carry and current_basis_pct <= pos["sl_basis"]:
-                        reason = "stop_loss_basis"
-                
-                # B. PNL 기반 청산 (절대 이익/손실)
-                if not reason:
-                    if abs(pnl_pct) >= AUTO_CLOSE_PNL_PCT:
-                        reason = "pnl_target_hit"
-                        
-                # C. 시간 기반 청산 (장기 포지션 청산)
-                if not reason:
-                    if holding_time_min >= MAX_HOLDING_MIN:
-                        reason = "max_holding_time"
+        # LOT_SIZE 필터 가져오기
+        lot_size_filters = get_lot_size_filters(symbol, trade_env, trade_type)
+        if not lot_size_filters:
+            return jsonify({"error": f"심볼 {symbol}의 LOT_SIZE 필터를 가져올 수 없습니다. 거래 규칙 확인 필요."}), 500
+        min_qty = lot_size_filters['minQty']
+        step_size = lot_size_filters['stepSize']
 
-                # 4. 포지션 청산
-                if reason:
-                    log(f"[AUTO CLOSE] {symbol} | Reason: {reason} | PNL: {pnl_pct:.2f}% | Holding: {holding_time_min:.1f} min")
-                    close_position(symbol, reason=reason)
+        order_quantity = 0.0
+        order_price = 0.0
+        order_final_type = order_execution_type # 기본적으로 선택된 주문 유형 사용
 
-            except Exception as e:
-                log(f"[ERR check_positions_loop] {symbol}: {e}\n{traceback.format_exc()}")
+        if is_close_position:
+            # 포지션 청산 로직 (항상 지정가로 체결 가능성 높은 가격)
+            order_final_type = ORDER_TYPE_LIMIT # 청산은 항상 지정가
+            current_position_qty = 0.0
+            if trade_type == 'spot':
+                account_info = client_to_use.get_account()
+                for asset in account_info['balances']:
+                    if asset['asset'] == symbol.replace('USDT', ''):
+                        current_position_qty = float(asset['free'])
+                        break
+                if current_position_qty <= 0:
+                    return jsonify({"message": f"{trade_env.upper()} {trade_type.upper()} {symbol}: 청산할 현물 잔고가 없습니다. (현재 잔고: {current_position_qty})", "order": None}), 200
+                order_quantity = _round_step_size(current_position_qty, step_size)
+                side = SIDE_SELL # 현물 매도는 항상 SELL
+                order_price = _round_step_size(best_bid - tick_size, tick_size) # 매도 시 최고 매수 호가보다 1틱 낮게 (더 공격적)
+                if order_price <= 0: order_price = _round_step_size(best_bid, tick_size) # 0이하 방지
+                logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol}: 현물 청산 주문 준비 (매도): 수량 {order_quantity}, 지정가 {order_price}")
+
+            elif trade_type == 'margin':
+                account_info = client_to_use.get_margin_account()
+                for user_asset in account_info['userAssets']:
+                    if user_asset['asset'] == symbol.replace('USDT', ''):
+                        current_position_qty = float(user_asset['free'])
+                        break
+                if current_position_qty <= 0:
+                    return jsonify({"message": f"{trade_env.upper()} {trade_type.upper()} {symbol}: 청산할 마진 잔고가 없습니다. (현재 잔고: {current_position_qty})", "order": None}), 200
+                order_quantity = _round_step_size(current_position_qty, step_size)
+                side = SIDE_SELL # 마진 매도는 항상 SELL (롱 포지션 청산)
+                order_price = _round_step_size(best_bid - tick_size, tick_size) # 매도 시 최고 매수 호가보다 1틱 낮게 (더 공격적)
+                if order_price <= 0: order_price = _round_step_size(best_bid, tick_size) # 0이하 방지
+                logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol}: 마진 청산 주문 준비 (매도): 수량 {order_quantity}, 지정가 {order_price}")
+
+            elif trade_type == 'futures':
+                positions = client_to_use.futures_account()['positions']
+                current_position_qty = 0.0
+                for pos in positions:
+                    if pos['symbol'] == symbol:
+                        current_position_qty = float(pos['positionAmt'])
+                        break
+                
+                if current_position_qty == 0:
+                    return jsonify({"message": f"{trade_env.upper()} {trade_type.upper()} {symbol}: 청산할 선물 포지션이 없습니다. (현재 포지션: {current_position_qty})", "order": None}), 200
+                
+                order_quantity = _round_step_size(abs(current_position_qty), step_size)
+                
+                if current_position_qty > 0: # 롱 포지션 청산 (매도)
+                    side = SIDE_SELL
+                    order_price = _round_step_size(best_bid - tick_size, tick_size) # 매도 시 최고 매수 호가보다 1틱 낮게 (더 공격적)
+                    if order_price <= 0: order_price = _round_step_size(best_bid, tick_size) # 0이하 방지
+                    logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol}: 롱 포지션 청산 (매도) 수량 {order_quantity}, 지정가 {order_price}")
+                else: # 숏 포지션 청산 (매수)
+                    side = SIDE_BUY
+                    order_price = _round_step_size(best_ask + tick_size, tick_size) # 매수 시 최저 매도 호가보다 1틱 높게 (더 공격적)
+                    logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol}: 숏 포지션 청산 (매수) 수량 {order_quantity}, 지정가 {order_price}")
         
-        time.sleep(SCAN_INTERVAL_SEC)
+        else: # 일반 매수/매도 진입 로직 (order_execution_type에 따름)
+            if side == SIDE_BUY:
+                # 매수 수량: 거래소 최소 주문 수량 또는 11 USDT 상당 수량 중 더 작은 값
+                quantity_for_11_usdt = 11.0 / current_price
+                calculated_buy_qty = _round_step_size(quantity_for_11_usdt, step_size)
+                
+                order_quantity = min(min_qty, calculated_buy_qty) # 더 작은 값 선택
+                
+                # 매수 가격: 지정가인 경우 최저 매도 호가에 1 틱을 더한 가격 (더 공격적)
+                if order_final_type == ORDER_TYPE_LIMIT:
+                    order_price = _round_step_size(best_ask + tick_size, tick_size)
+                    # 가격이 0 이하가 되는 것을 방지 (매우 낮은 가격의 코인일 경우)
+                    if order_price <= 0: 
+                        order_price = _round_step_size(current_price * 0.99, tick_size) # 안전하게 1% 낮은 가격으로 설정 (fallback)
+                
+                logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol} 매수 주문 준비: 수량 {order_quantity}, 유형 {order_final_type}, 지정가 {order_price if order_final_type == ORDER_TYPE_LIMIT else 'N/A'}")
+
+            elif side == SIDE_SELL:
+                # 매도 수량: 11 USDT 상당의 수량을 매도 (숏 포지션 진입)
+                quantity_for_11_usdt = 11.0 / current_price
+                order_quantity = _round_step_size(quantity_for_11_usdt, step_size)
+                
+                # 매도 가격: 지정가인 경우 최고 매수 호가에서 1 틱을 뺀 가격 (더 공격적)
+                if order_final_type == ORDER_TYPE_LIMIT:
+                    order_price = _round_step_size(best_bid - tick_size, tick_size)
+                    if order_price <= 0: # 가격이 0 이하가 되는 것을 방지
+                        order_price = _round_step_size(current_price * 1.01, tick_size) # 안전하게 1% 높은 가격으로 설정 (fallback)
+                
+                logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol} 매도 주문 준비 (숏 진입): 수량 {order_quantity}, 유형 {order_final_type}, 지정가 {order_price if order_final_type == ORDER_TYPE_LIMIT else 'N/A'}")
 
 
-# ========= WS =========
-def ws_run_forever(url, on_message, name):
-    backoff = 1
-    while True:
-        try:
-            ws = WebSocketApp(url, on_message=on_message,
-                              on_error=lambda w,e: log(f"[WS {name} err] {e}"),
-                              on_close=lambda *a: log(f"[WS {name} closed]"))
-            log(f"[WS {name}] connecting...")
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-            log(f"[WS {name}] disconnected")
-        except Exception as e:
-            log(f"[WS {name} exception] {e}")
-        time.sleep(backoff); backoff = min(backoff*2, 60); log(f"[WS {name}] reconnect in {backoff}s")
+        # 최종 수량 유효성 검사
+        is_valid_qty, msg = validate_quantity(symbol, order_quantity, trade_env, trade_type)
+        if not is_valid_qty:
+            logging.warning(f"최종 주문 수량 유효성 검사 실패 ({symbol}, {order_quantity}): {msg}")
+            return jsonify({"error": f"최종 주문 수량 유효성 검사 실패: {msg}"}), 400
+        
+        # 주문 수량이 0인 경우 (예: 매도할 포지션이 없는 경우)
+        if order_quantity <= 0:
+            return jsonify({"message": f"{symbol}에 대한 {side} 주문을 실행할 유효한 수량이 없습니다. (현재 포지션이 0이거나 잔액 부족)","order": None}), 200
 
-def _ws_spot():
-    url = "wss://stream.binance.com/ws/!miniTicker@arr"
-    def on_msg(ws, msg):
-        try:
-            arr = json.loads(msg)
-            with ws_lock:
-                for x in arr:
-                    s = x.get("s"); c = x.get("c")
-                    if s and s.endswith("USDT") and c: spot_last[s] = float(c)
-        except Exception: pass
-    ws_run_forever(url, on_msg, "spot")
 
-def _ws_fut():
-    url = "wss://fstream.binance.com/ws/!markPrice@arr"
-    def on_msg(ws, msg):
-        try:
-            arr = json.loads(msg)
-            with ws_lock:
-                for x in arr:
-                    s = x.get("s"); p = x.get("p") or x.get("P")
-                    if s and s.endswith("USDT") and p: fut_last[s] = float(p)
-        except Exception: pass
-    ws_run_forever(url, on_msg, "futures")
+        # --- 주문 제출 ---
+        order = None
+        if order_final_type == ORDER_TYPE_LIMIT:
+            if trade_type == 'spot':
+                order = client_to_use.create_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_GTC,
+                    quantity=order_quantity,
+                    price=order_price
+                )
+            elif trade_type == 'margin':
+                order = client_to_use.create_margin_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_GTC,
+                    quantity=order_quantity,
+                    price=order_price,
+                    isIsolated='TRUE' # 격리 마진 사용 예시
+                )
+            elif trade_type == 'futures':
+                order = client_to_use.create_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_LIMIT,
+                    timeInForce=TIME_IN_FORCE_GTC,
+                    quantity=order_quantity,
+                    price=order_price
+                )
+        elif order_final_type == ORDER_TYPE_MARKET:
+            if trade_type == 'spot':
+                order = client_to_use.create_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=order_quantity
+                )
+            elif trade_type == 'margin':
+                order = client_to_use.create_margin_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=order_quantity,
+                    isIsolated='TRUE'
+                )
+            elif trade_type == 'futures':
+                order = client_to_use.create_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=order_quantity
+                )
+        
+        logging.info(f"{trade_env.upper()} {trade_type.upper()} {order_final_type} 주문 성공 ({side} {order_quantity} {symbol} @ {order_price if order_final_type == ORDER_TYPE_LIMIT else '시장가'}): {order}")
 
-def start_websockets():
-    threading.Thread(target=_ws_spot, daemon=True).start()
-    threading.Thread(target=_ws_fut, daemon=True).start()
-    threading.Thread(target=refresh_top_universe_loop, daemon=True).start()
+        # --- 거래 내역 기록 (실제 체결 정보는 추후 확인 필요) ---
+        executed_qty = float(order.get('executedQty', 0))
+        cummulative_quote_qty = float(order.get('cummulativeQuoteQty', 0))
+        
+        fee = 0.0
+        profit = 0.0
+        profit_percentage = 0.0
 
-# ========= 자동 선정 =========
-def refresh_top_universe_loop():
-    global top_universe
-    while True:
-        try:
-            syms = get_top_symbols_rest(limit=TOP_N)
-            with ws_lock:
-                top_universe = syms
-        except Exception as e:
-            log(f"[ERR refresh_top_universe] {e}")
-        time.sleep(VOLUME_REFRESH_SEC)
+        # 시장가 주문의 경우 체결 가격을 order.get('fills')[0]['price'] 등으로 가져와야 함
+        # 여기서는 단순화를 위해 주문 가격(지정가) 또는 현재가(시장가)를 사용
+        actual_trade_price = order_price if order_final_type == ORDER_TYPE_LIMIT else current_price
 
-# ========= 엔트리 루프 =========
-def entry_loop():
-    entry_th = ENTRY_THRESHOLD_BPS/10000.0  # bps → 비율
-    while True:
-        try:
-            with state_lock:
-                open_cnt = len(positions)
-            if open_cnt >= MAX_CONCURRENT_POSITIONS:
-                time.sleep(SCAN_INTERVAL_SEC); continue
+        if executed_qty > 0 and cummulative_quote_qty > 0:
+            # 수수료율 가정 (현물 0.1%, 선물 Taker 0.04%, 마진 0.1% 가정)
+            fee_rate = 0.001 # 기본 현물/마진 수수료율
+            if trade_type == 'futures':
+                fee_rate = 0.0004 # 선물 Taker 수수료율
+            
+            estimated_fee = cummulative_quote_qty * fee_rate
+            fee = estimated_fee
 
-            # WS 후보 비면 REST 폴백
-            if USE_WEBSOCKET:
-                with ws_lock: syms_with_vol = list(top_universe)
-                if not syms_with_vol:
-                    log("[ENTRY] top_universe empty; WS not ready — fallback to REST")
-                    syms_with_vol = get_top_symbols_rest(limit=TOP_N)
-            else:
-                syms_with_vol = get_top_symbols_rest(limit=TOP_N)
-
-            if not syms_with_vol:
-                time.sleep(SCAN_INTERVAL_SEC); continue
-
-            view, best = [], None
-            for item in syms_with_vol:
-                sym, vol = item["symbol"], item["volume"]
-                with state_lock:
-                    if sym in positions: continue
-                b = calc_basis_pct_live(sym)
-                if b is None: continue
-                view.append({"symbol": sym, "basis_pct": b, "volume": vol})
-
-            # 스코어 최대값 선정
-            for it in view:
-                sym, b = it["symbol"], it["basis_pct"]
-                if b >= 0:
-                    score, mode = b, "carry"
+            # 수익 계산 (간단화된 로직, 실제 봇은 체결 이력과 포지션 매칭 필요)
+            if side == SIDE_SELL: # 롱 포지션 청산 (매도)
+                matched_buy_trade = None
+                for i in range(len(trade_history) -1, -1, -1):
+                    if trade_history[i]['symbol'] == symbol and trade_history[i]['side'] == SIDE_BUY and trade_history[i]['status'] == 'FILLED' and trade_history[i]['quantity'] == executed_qty and trade_history[i]['trade_type'] == trade_type and trade_history[i]['trade_env'] == trade_env:
+                        matched_buy_trade = trade_history[i]
+                        break
+                
+                if matched_buy_trade:
+                    buy_price = matched_buy_trade['price']
+                    gross_profit = (actual_trade_price - buy_price) * executed_qty # 실제 체결 가격으로 계산
+                    net_profit = gross_profit - fee - matched_buy_trade['fee']
+                    profit = net_profit
+                    if (buy_price * executed_qty) != 0:
+                        profit_percentage = (net_profit / (buy_price * executed_qty)) * 100
+                    logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol} 매도 수익 계산 완료: 수익금={profit}, 수익률={profit_percentage}%")
                 else:
-                    if not ALLOW_NEGATIVE_BASIS: continue
-                    score, mode = -b, "reverse"
-                if (best is None) or (score > best[0]): best = (score, sym, mode, b)
-
-            # 대시보드용 Top5
-            top_view = []
-            for it in view:
-                bb = it["basis_pct"]
-                top_view.append({"symbol": it["symbol"], "basis_pct": bb, "expected": abs(bb),
-                                 "mode": "carry" if bb>=0 else "reverse", "volume": it.get("volume",0)})
-            with state_lock:
-                global last_top_symbols
-                last_top_symbols = sorted(top_view, key=lambda x: x["expected"], reverse=True)[:5]
-
-            if not best:
-                time.sleep(SCAN_INTERVAL_SEC); continue
-
-            score, sym, mode, b_now = best
-            if score < entry_th:    # 임계치 미달
-                time.sleep(SCAN_INTERVAL_SEC); continue
-
-            ok = enter_position(sym, mode)
-            if ok:
-                with state_lock: oc = len(positions)
-                log(f"[SELECTED ENTRY] {sym} mode={mode} expected={(score*100):.{DEC_PCT}f}% basis_now={(b_now*100):.{DEC_PCT}f}% open_cnt={oc}")
-        except Exception as e:
-            log(f"[ERR entry_loop] {e}\n{traceback.format_exc()}")
-        time.sleep(SCAN_INTERVAL_SEC)
-
-# ========= 리밸런싱(옵션) =========
-def get_spot_usdt():
-    try:
-        b = backoff_call(client.get_asset_balance, asset="USDT")
-        return float(b["free"]) + float(b["locked"])
-    except Exception: return 0.0
-
-def get_futures_usdt():
-    try:
-        bal = backoff_call(client.futures_account_balance)
-        for x in bal:
-            if x.get("asset") == "USDT":
-                return float(x.get("balance", 0))
-        return 0.0
-    except Exception: return 0.0
-
-def rebalance_transfer(asset, amount, type_):
-    if DRY_RUN:
-        log(f"[DRY][REBAL] transfer {asset} {amount} type={type_}")
-        telegram_send(f"{run_tag()} {EMOJI_EXEC} [REBAL] transfer {float(amount):.{DEC_USDT}f} {asset}")
-        return
-    try:
-        backoff_call(client.futures_account_transfer, asset=asset, amount=f"{amount}", type=type_)
-        telegram_send(f"{run_tag()} {EMOJI_EXEC} [REBAL] transfer {float(amount):.{DEC_USDT}f} {asset}")
-    except Exception as e:
-        telegram_send(tg_error_message("USDT", "rebalance_transfer", e))
-
-def rebalance_loop():
-    while True:
-        try:
-            if not REBALANCE_ENABLED:
-                time.sleep(REBALANCE_INTERVAL_SEC); continue
-            spot_u = get_spot_usdt()
-            fut_u  = get_futures_usdt()
-            total = spot_u + fut_u
-            if total <= 0:
-                time.sleep(REBALANCE_INTERVAL_SEC); continue
-            spot_ratio = spot_u / total
-            low  = REBALANCE_TARGET_SPOT_RATIO - REBALANCE_BAND
-            high = REBALANCE_TARGET_SPOT_RATIO + REBALANCE_BAND
-            if spot_ratio < low:
-                delta = (REBALANCE_TARGET_SPOT_RATIO - spot_ratio) * total
-                amt = max(0.0, min(delta, fut_u))
-                if amt > 0: rebalance_transfer("USDT", amt, 2)
-            elif spot_ratio > high:
-                delta = (spot_ratio - REBALANCE_TARGET_SPOT_RATIO) * total
-                amt = max(0.0, min(delta, spot_u))
-                if amt > 0: rebalance_transfer("USDT", amt, 1)
-        except Exception as e:
-            log(f"[ERR rebalance] {e}")
-        time.sleep(REBALANCE_INTERVAL_SEC)
-
-# ========= 보호 로직 =========
-def require_token(req):
-    """프로그램성 API 보호용 헤더 토큰 (X-API-TOKEN). 대시보드 토큰과 별개."""
-    if not API_TOKEN: return True
-    return req.headers.get("X-API-TOKEN") == API_TOKEN
-
-def dashboard_token_ok(req):
-    """대시보드 및 연동 API 보호 토큰. 쿼리파라미터 token 또는 헤더 X-DASHBOARD-TOKEN 허용."""
-    if not DASHBOARD_AUTH_TOKEN:
-        return True
-    header_token = req.headers.get("X-DASHBOARD-TOKEN", "")
-    query_token = req.args.get("token", "")
-    return (header_token == DASHBOARD_AUTH_TOKEN) or (query_token == DASHBOARD_AUTH_TOKEN)
-
-def require_dashboard_token():
-    if not dashboard_token_ok(request):
-        abort(401)
-
-def check_webhook_valid(data: dict) -> bool:
-    if not WEBHOOK_CHECK_ENABLED: return True
-    ts = data.get("timestamp")
-    valid_for = int(data.get("valid_for", WEBHOOK_DEFAULT_VALID))
-    if not ts: return False
-    return (now_ms() - int(ts)) <= valid_for * 1000
-
-# ========= API =========
-@app.get("/health")
-def health(): return jsonify({"status":"UP","ts":now_ms()})
-
-@app.post("/webhook")
-def webhook():
-    # 프로그램성 webhook은 기존 API_TOKEN 정책 유지
-    if not require_token(request): return jsonify({"status":"unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    if not check_webhook_valid(data): return jsonify({"status":"expired"}), 400
-    sym = (data.get("symbol") or "").upper()
-    action = (data.get("action") or "").lower()
-    if not sym: return jsonify({"status":"bad_request"}), 400
-    with state_lock:
-        if sym in positions: return jsonify({"status":"position_open"}), 409
-        if len(positions) >= MAX_CONCURRENT_POSITIONS: return jsonify({"status":"too_many_positions"}), 429
-    mode = "carry" if action=="buy" else "reverse"
-    ok = enter_position(sym, mode)
-    return jsonify({"status":"ok" if ok else "fail"})
-
-@app.post("/enter")
-def enter_api():
-    # 대시보드에서 호출되는 API → 대시보드 토큰 요구
-    require_dashboard_token()
-    data = request.get_json(silent=True) or {}
-    sym = (data.get("symbol") or "").upper()
-    mode = (data.get("mode") or "").lower()
-    if not sym or mode not in ("carry","reverse"): return jsonify({"status":"bad_request"}), 400
-    with state_lock:
-        if sym in positions: return jsonify({"status":"position_open"}), 409
-        if len(positions) >= MAX_CONCURRENT_POSITIONS: return jsonify({"status":"too_many_positions"}), 429
-    ok = enter_position(sym, mode)
-    return jsonify({"status":"ok" if ok else "fail"})
-
-@app.post("/toggle_blacklist")
-def toggle_blacklist():
-    require_dashboard_token()
-    data = request.get_json(silent=True) or {}
-    sym = (data.get("symbol") or "").upper()
-    if not sym: return jsonify({"status":"bad_request"}), 400
-    with state_lock:
-        if sym in RUNTIME_BLACKLIST:
-            RUNTIME_BLACKLIST.remove(sym); status = "removed"
+                    logging.warning(f"{trade_env.upper()} {trade_type.upper()} {symbol} 매도에 대한 매칭되는 매수 기록을 찾을 수 없습니다. 수익 계산 생략.")
+            elif side == SIDE_BUY and trade_type == 'futures' and current_position_qty < 0: # 선물 숏 포지션 청산 (매수)
+                matched_sell_trade = None
+                for i in range(len(trade_history) -1, -1, -1):
+                    if trade_history[i]['symbol'] == symbol and trade_history[i]['side'] == SIDE_SELL and trade_history[i]['status'] == 'FILLED' and trade_history[i]['quantity'] == executed_qty and trade_history[i]['trade_type'] == trade_type and trade_history[i]['trade_env'] == trade_env:
+                        matched_sell_trade = trade_history[i]
+                        break
+                
+                if matched_sell_trade:
+                    sell_price = matched_sell_trade['price']
+                    gross_profit = (sell_price - actual_trade_price) * executed_qty # 숏 포지션은 매도-매수 차익
+                    net_profit = gross_profit - fee - matched_sell_trade['fee']
+                    profit = net_profit
+                    if (sell_price * executed_qty) != 0:
+                        profit_percentage = (net_profit / (sell_price * executed_qty)) * 100
+                    logging.info(f"{trade_env.upper()} {trade_type.upper()} {symbol} 숏 포지션 청산 수익 계산 완료: 수익금={profit}, 수익률={profit_percentage}%")
+                else:
+                    logging.warning(f"{trade_env.upper()} {trade_type.upper()} {symbol} 숏 포지션 청산에 대한 매칭되는 매도 기록을 찾을 수 없습니다. 수익 계산 생략.")
         else:
-            RUNTIME_BLACKLIST.add(sym); status = "added"
-    return jsonify({"status":"ok","action":status,"symbol":sym})
+            logging.warning(f"주문 {order.get('orderId')} ({symbol} {side})이 체결되지 않았거나 수량/금액이 0입니다. 수익 계산 생략.")
 
-@app.post("/close")
-def close_api():
-    require_dashboard_token()
-    data = request.get_json(silent=True) or {}
-    sym = (data.get("symbol") or "").upper()
-    if not sym: return jsonify({"status":"bad_request"}), 400
-    ok = close_position(sym, reason="manual")
-    return jsonify({"status":"ok" if ok else "fail"})
 
-@app.get("/status")
-def status_api():
-    require_dashboard_token()
-    with state_lock:
-        p_count = len(positions)
-        logs_view = logs_ring[:]
-        tx_view = transactions[:]
-        top_view = last_top_symbols[:]
-        bl_view = list(RUNTIME_BLACKLIST)
-        pos_view = []
-        for sym, p in positions.items():
-            s_now, f_now = spot_last.get(sym), fut_last.get(sym)
-            pnl_data = estimate_unrealized_pnl(p, s_now, f_now) if s_now and f_now else None
-            pos_view.append({
-                "symbol": sym, "dir": p["dir"], "qty": p["qty"], "s_in": p["s_in"],
-                "f_in": p["f_in"], "basis_in": p["basis_in"],
-                "t_open": p["t_open"], "pnl": pnl_data,
-                "s_now": s_now, "f_now": f_now
-            })
+        trade_record = {
+            "timestamp": datetime.now().isoformat(),
+            "symbol": symbol,
+            "side": side,
+            "trade_type": trade_type, # 거래 유형 기록
+            "trade_env": trade_env, # 거래 환경 기록
+            "quantity": executed_qty, # 실제 체결 수량
+            "price": actual_trade_price, # 실제 체결 가격 (지정가 또는 시장가)
+            "orderId": order.get('orderId'),
+            "status": order.get('status'),
+            "fee": fee,
+            "profit": profit,
+            "profit_percentage": profit_percentage,
+            "is_close_position": is_close_position, # 청산 주문 여부 기록
+            "order_execution_type": order_final_type # 주문 실행 유형 기록
+        }
+        
+        trade_history.append(trade_record)
+        save_trade_history() # 변경된 내역 파일에 저장
+
+        return jsonify({"message": f"주문 요청 성공 ({order.get('status')}): {side} {executed_qty} {symbol} @ {actual_trade_price} ({trade_env.upper()} {trade_type.upper()})", "order": order})
+    
+    except BinanceAPIException as e:
+        logging.error(f"{trade_env.upper()} {trade_type.upper()} 주문 실패 (API 오류 - {side} {symbol}): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+        if e.code in [None, -1022]:
+            logging.error("API 키/시크릿, IP 화이트리스트, 서버 시간 동기화를 확인하세요.")
+        elif e.code == -2019: # 마진 부족
+            logging.error("마진 부족 오류: 해당 계좌에 충분한 잔고가 있는지 확인하세요.")
+        elif e.code == -1013: # FILTER_FAILURE_LOT_SIZE or MIN_NOTIONAL
+            logging.error("주문 수량/가격 필터 오류: 수량, 최소/최대/스텝 사이즈 또는 최소 명목 가치를 확인하세요.")
+        raise
+    except Exception as e:
+        logging.error(f"{trade_env.upper()} {trade_type.upper()} 주문 중 알 수 없는 오류 발생 ({side} {symbol}): {e}")
+        raise
+
+@app.route('/api/account_balance', methods=['GET']) # 엔드포인트 이름 변경
+@binance_api_retry_decorator
+def get_account_balance(): # 함수 이름 변경
+    """
+    거래 유형(현물/마진/선물) 및 환경(테스트넷/실제)에 따라 계좌의 USDT 잔고를 가져옵니다.
+    """
+    trade_env = request.args.get('trade_env', 'futures').strip() # 공백 제거
+    trade_type = request.args.get('trade_type', 'futures').strip() # 공백 제거
+
+    client_to_use = None
+    if trade_env in clients and trade_type in clients[trade_env]:
+        client_to_use = clients[trade_env][trade_type]
+    else:
+        return jsonify({"error": "유효하지 않은 거래 환경 또는 유형입니다."}), 400
+
+    usdt_balance = 0.0
+    try:
+        if trade_type == 'spot':
+            account_info = client_to_use.get_account()
+            for asset in account_info['balances']:
+                if asset['asset'] == 'USDT':
+                    usdt_balance = float(asset['free']) # 현물은 free 잔고
+                    break
+        elif trade_type == 'margin':
+            account_info = client_to_use.get_margin_account()
+            for user_asset in account_info['userAssets']:
+                if user_asset['asset'] == 'USDT':
+                    usdt_balance = float(user_asset['free']) # 마진은 free 잔고
+                    break
+        elif trade_type == 'futures':
+            account_info = client_to_use.futures_account()
+            for asset in account_info['assets']:
+                if asset['asset'] == 'USDT':
+                    usdt_balance = float(asset['walletBalance']) # 선물은 walletBalance
+                    break
+        else:
+            return jsonify({"error": "유효하지 않은 거래 유형입니다."}), 400
+
+        logging.info(f"{trade_env.upper()} {trade_type.upper()} 계좌 USDT 잔고 조회 성공: {usdt_balance}")
+        api_status[f"{trade_env}_{trade_type}"]["status"] = "연결됨"
+        api_status[f"{trade_env}_{trade_type}"]["message"] = "API 연결 정상."
+        return jsonify({"asset": "USDT", "balance": usdt_balance})
+    except BinanceAPIException as e:
+        logging.error(f"{trade_env.upper()} {trade_type.upper()} 계좌 잔고 조회 실패 (API 오류): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+        api_status[f"{trade_env}_{trade_type}"]["status"] = "오류"
+        api_status[f"{trade_env}_{trade_type}"]["message"] = f"API 오류: {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}"
+        if e.code in [None, -1022]:
+            logging.error("API 키/시크릿, IP 화이트리스트, 시스템 시간 동기화를 확인하세요.")
+        raise
+    except Exception as e:
+        logging.error(f"{trade_env.upper()} {trade_type.upper()} 계좌 잔고 조회 중 알 수 없는 오류 발생: {e}")
+        api_status[f"{trade_env}_{trade_type}"]["status"] = "오류"
+        api_status[f"{trade_env}_{trade_type}"]["message"] = f"서버 오류: {str(e)}"
+        raise
+
+@app.route('/api/all_account_balances', methods=['GET'])
+@binance_api_retry_decorator
+def get_all_account_balances():
+    """모든 환경/유형의 USDT 잔고를 가져옵니다."""
+    all_balances = {}
+    environments = ['testnet', 'real']
+    types = ['spot', 'futures'] # 마진은 현물 잔고와 동일하게 처리되므로 별도 조회하지 않음
+
+    for env in environments:
+        for typ in types:
+            try:
+                client_obj = clients[env][typ]
+                usdt_balance = 0.0
+                if typ == 'spot':
+                    account_info = client_obj.get_account()
+                    for asset in account_info['balances']:
+                        if asset['asset'] == 'USDT':
+                            usdt_balance = float(asset['free'])
+                            break
+                elif typ == 'futures':
+                    account_info = client_obj.futures_account()
+                    for asset in account_info['assets']:
+                        if asset['asset'] == 'USDT':
+                            usdt_balance = float(asset['walletBalance'])
+                            break
+                all_balances[f"{env}_{typ}"] = usdt_balance
+                api_status[f"{env}_{typ}"]["status"] = "연결됨"
+                api_status[f"{env}_{typ}"]["message"] = "API 연결 정상."
+            except BinanceAPIException as e:
+                logging.error(f"모든 잔고 조회 실패 ({env.upper()} {typ.upper()}): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+                all_balances[f"{env}_{typ}"] = "오류"
+                api_status[f"{env}_{typ}"]["status"] = "오류"
+                api_status[f"{env}_{typ}"]["message"] = f"API 오류: {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}"
+            except Exception as e:
+                logging.error(f"모든 잔고 조회 중 알 수 없는 오류 발생 ({env.upper()} {typ.upper()}): {e}")
+                all_balances[f"{env}_{typ}"] = "오류"
+                api_status[f"{env}_{typ}"]["status"] = "오류"
+                api_status[f"{env}_{typ}"]["message"] = f"서버 오류: {str(e)}"
+    return jsonify(all_balances)
+
+
+@app.route('/api/open_positions', methods=['GET'])
+@binance_api_retry_decorator
+def get_open_positions():
+    """
+    거래 유형(현물/마진/선물) 및 환경(테스트넷/실제)에 따라 현재 열려 있는 포지션들을 가져옵니다.
+    현물/마진은 보유 자산 목록을 반환합니다.
+    """
+    trade_env = request.args.get('trade_env', 'futures').strip() # 공백 제거
+    trade_type = request.args.get('trade_type', 'futures').strip() # 공백 제거
+    positions = []
+
+    client_to_use = None
+    if trade_env in clients and trade_type in clients[trade_env]:
+        client_to_use = clients[trade_env][trade_type]
+    else:
+        return jsonify({"error": "유효하지 않은 거래 환경 또는 유형입니다."}), 400
+
+    try:
+        if trade_type == 'spot':
+            account_info = client_to_use.get_account()
+            for asset in account_info['balances']:
+                free_qty = float(asset['free'])
+                if free_qty > 0 and asset['asset'] != 'USDT': # USDT 제외, 0이 아닌 잔고만 포지션으로 간주
+                    positions.append({
+                        "symbol": asset['asset'] + "USDT", # 예: BTC -> BTCUSDT
+                        "positionAmt": free_qty,
+                        "entryPrice": None,
+                        "unrealizedProfit": None,
+                        "liquidationPrice": None
+                    })
+        elif trade_type == 'margin':
+            account_info = client_to_use.get_margin_account()
+            for user_asset in account_info['userAssets']:
+                free_qty = float(user_asset['free'])
+                locked_qty = float(user_asset['locked'])
+                total_qty = free_qty + locked_qty
+                if total_qty > 0 and user_asset['asset'] != 'USDT': # USDT 제외, 0이 아닌 잔고만 포지션으로 간주
+                    positions.append({
+                        "symbol": user_asset['asset'] + "USDT",
+                        "positionAmt": total_qty,
+                        "entryPrice": None,
+                        "unrealizedProfit": None,
+                        "liquidationPrice": None
+                    })
+        elif trade_type == 'futures':
+            account_info = client_to_use.futures_account()
+            for position in account_info['positions']:
+                if float(position['positionAmt']) != 0: # 포지션이 0이 아닌 것만 필터링
+                    positions.append({
+                        "symbol": position['symbol'],
+                        "positionAmt": float(position['positionAmt']),
+                        "entryPrice": float(position.get('entryPrice', 0.0)), # .get()으로 KeyError 방지
+                        "unrealizedProfit": float(position.get('unRealizedProfit', 0.0)), # .get()으로 KeyError 방지
+                        "liquidationPrice": float(position.get('liquidationPrice', 0.0)) if position.get('liquidationPrice') else None # .get()으로 KeyError 방지
+                    })
+        else:
+            return jsonify({"error": "유효하지 않은 거래 유형입니다."}), 400
+
+        logging.info(f"{trade_env.upper()} {trade_type.upper()} 열린 포지션 조회 성공: {len(positions)}개 포지션.")
+        api_status[f"{trade_env}_{trade_type}"]["status"] = "연결됨"
+        api_status[f"{trade_env}_{trade_type}"]["message"] = "API 연결 정상."
+        return jsonify(positions)
+    except BinanceAPIException as e:
+        logging.error(f"{trade_env.upper()} {trade_type.upper()} 열린 포지션 조회 실패 (API 오류): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+        api_status[f"{trade_env}_{trade_type}"]["status"] = "오류"
+        api_status[f"{trade_env}_{trade_type}"]["message"] = f"API 오류: {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}"
+        if e.code in [None, -1022]:
+            logging.error("API 키/시크릿, IP 화이트리스트, 시스템 시간 동기화를 확인하세요.")
+        raise
+    except Exception as e:
+        logging.error(f"{trade_env.upper()} {trade_type.upper()} 열린 포지션 조회 중 알 수 없는 오류 발생: {e}")
+        api_status[f"{trade_env}_{trade_type}"]["status"] = "오류"
+        api_status[f"{trade_env}_{trade_type}"]["message"] = f"서버 오류: {str(e)}"
+        raise
+
+@app.route('/api/trade_history', methods=['GET'])
+def get_trade_history_and_performance():
+    """
+    저장된 거래 내역과 누적 수익 정보를 반환합니다.
+    """
+    cumulative_profit = 0.0
+    
+    # 펀딩비와 같은 기타 수입/지출을 가져와서 누적 수익에 반영 (실제 선물 계좌에서만)
+    total_funding_fees_testnet = 0.0
+    total_funding_fees_real = 0.0
+
+    try:
+        income_history_testnet = clients['testnet']['futures'].futures_income_history()
+        for income in income_history_testnet:
+            if income['incomeType'] == 'FUNDING_FEE':
+                total_funding_fees_testnet += float(income['income'])
+    except BinanceAPIException as e:
+        logging.warning(f"테스트넷 펀딩비 내역 조회 실패 (API 오류): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+    except Exception as e:
+        logging.warning(f"테스트넷 펀딩비 내역 조회 중 알 수 없는 오류 발생: {e}")
+
+    try:
+        income_history_real = clients['real']['futures'].futures_income_history()
+        for income in income_history_real:
+            if income['incomeType'] == 'FUNDING_FEE':
+                total_funding_fees_real += float(income['income'])
+    except BinanceAPIException as e:
+        logging.warning(f"실제 펀딩비 내역 조회 실패 (API 오류): {e.status_code if e.status_code else '알 수 없음'} - {e.message if e.message else '메시지 없음'}")
+    except Exception as e:
+        logging.warning(f"실제 펀딩비 내역 조회 중 알 수 없는 오류 발생: {e}")
+
+    total_realized_pnl_from_trades = 0.0
+    total_invested_for_pnl_calc = 0.0 # 수익률 계산을 위한 투자금 (간단화)
+
+    for trade in trade_history:
+        total_realized_pnl_from_trades += trade.get('profit', 0.0)
+        # 매수 거래의 금액만 수익률 계산을 위한 투자금으로 간주 (단순화)
+        if trade['side'] == SIDE_BUY and trade.get('status') == 'FILLED':
+            total_invested_for_pnl_calc += trade['quantity'] * trade['price']
+
+    # 펀딩비를 포함한 최종 누적 수익
+    cumulative_profit = total_realized_pnl_from_trades + total_funding_fees_testnet + total_funding_fees_real
+
+    cumulative_return_percentage = 0.0
+    # 펀딩비는 거래 원금에 직접 연결되지 않으므로, 투자금액은 실제 매수 금액만 사용
+    if total_invested_for_pnl_calc > 0:
+        # 수익률 계산 시 펀딩비도 포함된 총 수익을 사용
+        cumulative_return_percentage = (cumulative_profit / total_invested_for_pnl_calc) * 100
+    
     return jsonify({
-        "status": "ok",
-        "positions": pos_view,
-        "transactions": tx_view,
-        "logs": logs_view,
-        "top_symbols": top_view,
-        "blacklist": bl_view,
-        "open_count": p_count
+        "history": trade_history,
+        "cumulative": {
+            "profit": cumulative_profit,
+            "return_percentage": cumulative_return_percentage,
+            "total_funding_fees_testnet": total_funding_fees_testnet,
+            "total_funding_fees_real": total_funding_fees_real
+        }
     })
 
-@app.get("/")
-def dashboard():
-    require_dashboard_token()
-    # PNL 관련 표시 포맷
-    def fmt_pnl_usdt(x):
-        return f"+{x:.{DEC_USDT}f}" if x>0 else f"{x:.{DEC_USDT}f}"
-    
-    # 숫자 포맷
-    def fmt_num(x, dec):
-        if x is None: return "N/A"
-        if x >= 1000: return f"{x:,.{dec}f}"
-        return f"{x:.{dec}f}"
-    
-    # HTML 템플릿
-    html_template = """
-    <!DOCTYPE html>
-    <html lang="ko">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Arbitrage Bot Dashboard</title>
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 0; background-color: #1a1a2e; color: #fff; }
-            .container { padding: 20px; max-width: 1200px; margin: auto; }
-            h1, h2 { color: #94b8e2; border-bottom: 2px solid #2e2e50; padding-bottom: 5px; }
-            .status-box { background-color: #2e2e50; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
-            .status-box p { margin: 5px 0; }
-            .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-            .card { background-color: #2e2e50; padding: 15px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: transform 0.2s; }
-            .card:hover { transform: translateY(-5px); }
-            .table-container { overflow-x: auto; }
-            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-            th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #3a3a5e; }
-            th { background-color: #4a4a7a; color: #e0e0ff; }
-            tr:hover { background-color: #3a3a5e; }
-            .logs-container { max-height: 400px; overflow-y: scroll; background-color: #16162a; border-radius: 8px; padding: 15px; }
-            .log-line { margin: 0; padding: 2px 0; font-family: monospace; font-size: 12px; }
-            .btn { background-color: #0f4c75; color: white; border: none; padding: 8px 12px; border-radius: 5px; cursor: pointer; margin-left: 5px; }
-            .btn-close { background-color: #e74c3c; }
-            .btn-blacklist { background-color: #f39c12; }
-            .pnl-pos { color: #2ecc71; }
-            .pnl-neg { color: #e74c3c; }
-            .header-status { font-weight: bold; }
-        </style>
-    </head>
-    <body>
-    <div class="container">
-        <h1>Arbitrage Bot Dashboard {{ run_tag() }}</h1>
-        <div class="status-box">
-            <p><strong>Status:</strong> <span class="header-status">{{ EMOJI_LIVE if not DRY_RUN else EMOJI_DRY }} Running</span></p>
-            <p><strong>Open Positions:</strong> <span id="open-count">0</span> / {{ MAX_CONCURRENT_POSITIONS }}</p>
-            <p><strong>Last Updated:</strong> <span id="last-updated">N/A</span></p>
-        </div>
 
-        <div class="grid-container">
-            <div class="card">
-                <h2>Open Positions</h2>
-                <div class="table-container">
-                    <table id="positions-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Dir</th>
-                                <th>Qty</th>
-                                <th>Entry Price</th>
-                                <th>Basis In</th>
-                                <th>Current Basis</th>
-                                <th>Unrealized PNL</th>
-                                <th>Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Live Top Symbols ({{TOP_N}} Universe)</h2>
-                <div class="table-container">
-                    <table id="top-symbols-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Basis</th>
-                                <th>Expected</th>
-                                <th>Mode</th>
-                                <th>Volume</th>
-                                <th>Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Recent Transactions</h2>
-                <div class="table-container">
-                    <table id="transactions-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>PNL (USDT)</th>
-                                <th>PNL (%)</th>
-                                <th>Holding Time</th>
-                                <th>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Runtime Blacklist</h2>
-                <ul id="blacklist-list">
-                </ul>
-            </div>
-        </div>
-
-        <div class="card" style="margin-top: 20px;">
-            <h2>Logs</h2>
-            <div id="logs-container" class="logs-container">
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const DASHBOARD_AUTH_TOKEN = "{{ DASHBOARD_AUTH_TOKEN }}";
-        const REFRESH_MS = {{ DASHBOARD_REFRESH_MS }};
-
-        function fetchData() {
-            let url = "/status";
-            if (DASHBOARD_AUTH_TOKEN) {
-                url += `?token=${DASHBOARD_AUTH_TOKEN}`;
-            }
-
-            fetch(url)
-                .then(response => response.json())
-                .then(data => {
-                    updateDashboard(data);
-                })
-                .catch(error => console.error('Error fetching data:', error));
-        }
-
-        function updateDashboard(data) {
-            document.getElementById('open-count').innerText = data.open_count;
-            document.getElementById('last-updated').innerText = new Date().toLocaleTimeString();
-
-            // Open Positions
-            const posTableBody = document.getElementById('positions-table').querySelector('tbody');
-            posTableBody.innerHTML = '';
-            data.positions.forEach(pos => {
-                const row = posTableBody.insertRow();
-                row.insertCell(0).innerText = pos.symbol;
-                row.insertCell(1).innerText = pos.dir;
-                row.insertCell(2).innerText = pos.qty.toFixed({{ DEC_QTY }});
-                row.insertCell(3).innerText = pos.s_in.toFixed({{ DEC_USDT }});
-                row.insertCell(4).innerText = (pos.basis_in * 100).toFixed({{ DEC_PCT }}) + '%';
-                
-                const currentBasis = (pos.pnl && pos.s_now && pos.s_now > 0) ? ((pos.f_now - pos.s_now) / pos.s_now * 100).toFixed({{ DEC_PCT }}) + '%' : 'N/A';
-                row.insertCell(5).innerText = currentBasis;
-                
-                const pnlCell = row.insertCell(6);
-                if (pos.pnl) {
-                    const pnlText = `USDT: ${pos.pnl.pnl_total_usdt.toFixed({{ DEC_USDT }})} / %: ${(pos.pnl.pnl_total_rel * 100).toFixed({{ DEC_PCT }})}`;
-                    pnlCell.innerText = pnlText;
-                    pnlCell.className = pos.pnl.pnl_total_usdt >= 0 ? 'pnl-pos' : 'pnl-neg';
-                } else {
-                    pnlCell.innerText = 'N/A';
-                }
-                
-                const actionCell = row.insertCell(7);
-                const closeBtn = document.createElement('button');
-                closeBtn.innerText = 'Close';
-                closeBtn.className = 'btn btn-close';
-                closeBtn.onclick = () => closePosition(pos.symbol);
-                actionCell.appendChild(closeBtn);
-            });
-
-            // Top Symbols
-            const topTableBody = document.getElementById('top-symbols-table').querySelector('tbody');
-            topTableBody.innerHTML = '';
-            data.top_symbols.forEach(sym => {
-                const row = topTableBody.insertRow();
-                row.insertCell(0).innerText = sym.symbol;
-                row.insertCell(1).innerText = (sym.basis_pct * 100).toFixed({{ DEC_PCT }}) + '%';
-                row.insertCell(2).innerText = (sym.expected * 100).toFixed({{ DEC_PCT }}) + '%';
-                row.insertCell(3).innerText = sym.mode;
-                row.insertCell(4).innerText = sym.volume.toLocaleString();
-                const actionCell = row.insertCell(5);
-                
-                const enterBtn = document.createElement('button');
-                enterBtn.innerText = 'Enter';
-                enterBtn.className = 'btn';
-                enterBtn.onclick = () => enterPosition(sym.symbol, sym.mode);
-                actionCell.appendChild(enterBtn);
-                
-                const blacklistBtn = document.createElement('button');
-                blacklistBtn.innerText = 'BL';
-                blacklistBtn.className = 'btn btn-blacklist';
-                blacklistBtn.onclick = () => toggleBlacklist(sym.symbol);
-                actionCell.appendChild(blacklistBtn);
-            });
-            
-            // Recent Transactions
-            const txTableBody = document.getElementById('transactions-table').querySelector('tbody');
-            txTableBody.innerHTML = '';
-            data.transactions.slice().reverse().forEach(tx => {
-                const row = txTableBody.insertRow();
-                row.insertCell(0).innerText = tx.symbol;
-                const pnlCell = row.insertCell(1);
-                pnlCell.innerText = tx.pnl_usdt.toFixed({{ DEC_USDT }});
-                pnlCell.className = tx.pnl_usdt >= 0 ? 'pnl-pos' : 'pnl-neg';
-                row.insertCell(2).innerText = (tx.pnl_pct * 100).toFixed({{ DEC_PCT }}) + '%';
-                
-                const holdingTimeMin = tx.holding_time_ms / 60000;
-                row.insertCell(3).innerText = holdingTimeMin.toFixed(1) + ' min';
-                row.insertCell(4).innerText = tx.reason;
-            });
-            
-            // Blacklist
-            const blList = document.getElementById('blacklist-list');
-            blList.innerHTML = '';
-            data.blacklist.forEach(sym => {
-                const li = document.createElement('li');
-                li.innerText = sym;
-                const btn = document.createElement('button');
-                btn.innerText = 'Remove';
-                btn.className = 'btn btn-blacklist';
-                btn.onclick = () => toggleBlacklist(sym);
-                li.appendChild(btn);
-                blList.appendChild(li);
-            });
-
-            // Logs
-            const logsContainer = document.getElementById('logs-container');
-            logsContainer.innerHTML = '';
-            data.logs.forEach(logLine => {
-                const p = document.createElement('p');
-                p.className = 'log-line';
-                p.innerText = logLine;
-                logsContainer.appendChild(p);
-            });
-            logsContainer.scrollTop = logsContainer.scrollHeight;
-        }
-
-        function enterPosition(symbol, mode) {
-            fetch("/enter", {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "X-DASHBOARD-TOKEN": DASHBOARD_AUTH_TOKEN },
-                body: JSON.stringify({ symbol: symbol, mode: mode })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if(data.status !== "ok") alert("Failed to open position: " + data.status);
-            });
-        }
-
-        function closePosition(symbol) {
-            fetch("/close", {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "X-DASHBOARD-TOKEN": DASHBOARD_AUTH_TOKEN },
-                body: JSON.stringify({ symbol: symbol })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if(data.status !== "ok") alert("Failed to close position: " + data.status);
-            });
-        }
-
-        function toggleBlacklist(symbol) {
-            fetch("/toggle_blacklist", {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "X-DASHBOARD-TOKEN": DASHBOARD_AUTH_TOKEN },
-                body: JSON.stringify({ symbol: symbol })
-            })
-            .then(response => response.json())
-            .then(data => {
-                console.log(data);
-            });
-        }
-        
-        setInterval(fetchData, REFRESH_MS);
-        fetchData(); // Initial load
-    </script>
-    </body>
-    </html>
-    """
-    return render_template_string(html_template, **globals())
-
-if __name__ == "__main__":
-    if USE_WEBSOCKET:
-        start_websockets()
-    
-    # === 추가된 자동 청산 루프 시작 ===
-    threading.Thread(target=check_positions_loop, daemon=True).start()
-    
-    threading.Thread(target=entry_loop, daemon=True).start()
-    threading.Thread(target=rebalance_loop, daemon=True).start()
-    
-    log(f"[{run_tag()}] Starting server on http://{HOST}:{PORT}")
-    app.run(host=HOST, port=PORT, threaded=True)
+if __name__ == '__main__':
+    logging.info("Flask 서버 시작 중...")
+    app.run(host='0.0.0.0', port=5000, debug=True)
